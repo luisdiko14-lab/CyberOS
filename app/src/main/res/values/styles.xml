@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.CyberOS" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:colorAccent">#54F9A2</item>
+        <item name="android:statusBarColor">#07100D</item>
+        <item name="android:navigationBarColor">#07100D</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>
