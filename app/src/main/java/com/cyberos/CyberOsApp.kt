@@ -14,6 +14,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.provider.Settings
+import android.speech.RecognizerIntent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -51,7 +52,6 @@ import androidx.compose.material.icons.outlined.Apps
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.NotificationsActive
-import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.Button
@@ -88,7 +88,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -109,7 +108,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlin.math.sqrt
 
-private enum class CyberTheme(val title: String, val accent: Color) {
+internal enum class CyberTheme(val title: String, val accent: Color) {
     Matrix("MATRIX GREEN", Color(0xFF54F9A2)),
     Amber("AMBER TRACE", Color(0xFFFFB84A)),
     Pink("PINK NOISE", Color(0xFFFF5F9E)),
@@ -121,7 +120,7 @@ private enum class CyberTheme(val title: String, val accent: Color) {
 }
 
 private enum class ShellTab(val title: String) {
-    Terminal("TERM"), Store("STORE"), Files("FILES"), System("SYSTEM")
+    Desktop("DESK"), Terminal("TERM"), Store("STORE"), Files("FILES"), System("SYSTEM")
 }
 
 private data class MediaEntry(val uri: Uri, val name: String, val isVideo: Boolean)
@@ -132,10 +131,11 @@ fun CyberOsApp() {
     val activity = context as Activity
     val preferences = remember { context.getSharedPreferences("cyberos_shell", Context.MODE_PRIVATE) }
     var isBooted by rememberSaveable { mutableStateOf(false) }
-    var isUnlocked by rememberSaveable { mutableStateOf(false) }
-    var selectedTab by rememberSaveable { mutableStateOf(ShellTab.Terminal.name) }
+    var selectedTab by rememberSaveable { mutableStateOf(ShellTab.Desktop.name) }
     var themeName by rememberSaveable { mutableStateOf(preferences.getString("theme", CyberTheme.Matrix.name)) }
     var wallpaperUri by rememberSaveable { mutableStateOf(preferences.getString("wallpaper", null)) }
+        var biometricGateEnabled by rememberSaveable { mutableStateOf(preferences.getBoolean("biometric_shell_gate", false)) }
+        var shellBiometricVerified by remember { mutableStateOf(!preferences.getBoolean("biometric_shell_gate", false)) }
     var mediaRefresh by remember { mutableIntStateOf(0) }
     var mediaEntries by remember { mutableStateOf(emptyList<MediaEntry>()) }
     var audioEnabled by rememberSaveable { mutableStateOf(false) }
@@ -179,7 +179,7 @@ fun CyberOsApp() {
             runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
             wallpaperUri = uri.toString()
             preferences.edit().putString("wallpaper", uri.toString()).apply()
-            appendLog("Lock and shell background updated from selected media.")
+            appendLog("Shell background updated from selected media.")
         }
     }
     fun requestCapabilities(includeAudio: Boolean = false, includeMedia: Boolean = false, includeNotifications: Boolean = false) {
@@ -234,6 +234,7 @@ fun CyberOsApp() {
         val response = when {
             tokens == listOf("help") -> "help | status | theme <matrix|amber|pink|cobalt> | unlock 3344 | sideload core | launch firefox | overlay | audio | media | notify"
             tokens == listOf("status") -> "SHELL ONLINE // overlay=${if (overlayEnabled) "ready" else "locked"} // firefox=${if (firefoxInstalled) "present" else "absent"}"
+                tokens == listOf("diagnostics") -> "QUICK DIAGNOSTICS // shell online // media=${mediaEntries.size} indexed // theme=${theme.title}"
             tokens == listOf("clear") -> {
                 logs.clear()
                 "Terminal history cleared."
@@ -289,7 +290,32 @@ fun CyberOsApp() {
             }
             else -> "Unknown command. Type help."
         }
+        if (response.startsWith("Unknown command")) CyberSoundEngine.error()
         appendLog(response)
+    }
+
+    val voiceLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val spoken = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+            if (!spoken.isNullOrBlank()) {
+                val command = normalizeVoiceCommand(spoken)
+                appendLog("VOICE // $spoken")
+                executeCommand(command)
+            }
+        }
+    }
+
+    fun launchVoiceCommand() {
+        if (!hasPermission(context, Manifest.permission.RECORD_AUDIO)) {
+            requestCapabilities(includeAudio = true)
+            return
+        }
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            .putExtra(RecognizerIntent.EXTRA_PROMPT, "CyberOS command")
+            .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        runCatching { voiceLauncher.launch(intent) }
+            .onFailure { appendLog("Voice recognizer unavailable: ${it.message ?: "error"}") }
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -311,12 +337,13 @@ fun CyberOsApp() {
             delay(320)
             appendLog("[BOOT] $it")
         }
+        CyberSoundEngine.boot()
         delay(180)
         isBooted = true
     }
 
-    LaunchedEffect(mediaRefresh, isUnlocked) {
-        if (!isUnlocked || mediaRefresh == 0) return@LaunchedEffect
+    LaunchedEffect(mediaRefresh) {
+        if (mediaRefresh == 0) return@LaunchedEffect
         mediaEntries = withContext(Dispatchers.IO) { queryMedia(context) }
         appendLog("Media index refreshed: ${mediaEntries.size} items visible.")
     }
@@ -326,19 +353,33 @@ fun CyberOsApp() {
         return
     }
 
-    if (!isUnlocked) {
-        LockScreen(
-            theme = theme,
-            wallpaperUri = wallpaperUri,
-            onUnlock = { isUnlocked = true },
-            onEmergency = { appendLog("Emergency shell locked // local demo PIN required.") }
-        )
-        return
-    }
+        if (biometricGateEnabled && !shellBiometricVerified) {
+            BiometricGate(theme) {
+                val host = context as? androidx.fragment.app.FragmentActivity
+                if (host == null) appendLog("Biometric host activity unavailable.")
+                else CyberVaultCrypto.authenticateShell(
+                    host,
+                    onSuccess = { shellBiometricVerified = true },
+                    onFailure = { appendLog("Biometric authentication failed: $it") }
+                )
+            }
+            return
+        }
 
     val tab = ShellTab.entries.firstOrNull { it.name == selectedTab } ?: ShellTab.Terminal
-    Box(modifier = Modifier.fillMaxSize().background(Color(0xFF07100D))) {
+    Box(
+        modifier = Modifier.fillMaxSize().background(Color(0xFF07100D)).cyberGestureInput(
+            onFirefoxSwipe = {
+                if (!FirefoxInstaller.launch(context)) selectedTab = ShellTab.Store.name
+            },
+            onQuickDiagnostics = {
+                selectedTab = ShellTab.Terminal.name
+                executeCommand("diagnostics")
+            }
+        )
+    ) {
         WallpaperLayer(wallpaperUri)
+        CyberDigitalRain(theme, Modifier.fillMaxSize())
         ShellBackdrop(theme)
         Column(
             modifier = Modifier
@@ -352,9 +393,19 @@ fun CyberOsApp() {
             Spacer(Modifier.height(15.dp))
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 when (tab) {
+                    ShellTab.Desktop -> WindowManagerScreen(
+                        theme = theme,
+                        onCommand = ::executeCommand,
+                        onLaunchFirefox = {
+                            if (!FirefoxInstaller.launch(context)) webFallback = true
+                        },
+                        onOpenVault = { selectedTab = ShellTab.Files.name },
+                        onOpenScripts = { selectedTab = ShellTab.Terminal.name }
+                    )
                     ShellTab.Terminal -> TerminalScreen(
                         theme, logs, audioEnabled,
                         onCommand = ::executeCommand,
+                        onVoice = ::launchVoiceCommand,
                         onRequestAudio = { requestCapabilities(includeAudio = true) },
                         onClear = { logs.clear() }
                     )
@@ -369,6 +420,9 @@ fun CyberOsApp() {
                         },
                         onDownloadFirefox = { startFirefoxDownload(context, ::appendLog) },
                         onInstallDownloaded = { requestInstaller() },
+                        onPlayStore = {
+                            if (!FirefoxInstaller.openPlayStore(context)) appendLog("No Play Store or browser handler is available for Firefox.")
+                        },
                         onWebFallback = { webFallback = true },
                         onCloseWeb = { webFallback = false }
                     )
@@ -390,6 +444,7 @@ fun CyberOsApp() {
                     )
                     ShellTab.System -> SystemScreen(
                         theme,
+                        biometricGateEnabled = biometricGateEnabled,
                         overlayEnabled = overlayEnabled,
                         installAllowed = installAllowed,
                         audioAllowed = hasPermission(context, Manifest.permission.RECORD_AUDIO),
@@ -408,6 +463,25 @@ fun CyberOsApp() {
                             } else CyberAlerts.trigger(context)
                         },
                         onTheme = ::applyTheme,
+                        onBiometricGate = {
+                            if (biometricGateEnabled) {
+                                biometricGateEnabled = false
+                                shellBiometricVerified = true
+                                preferences.edit().putBoolean("biometric_shell_gate", false).apply()
+                            } else {
+                                val host = context as? androidx.fragment.app.FragmentActivity
+                                if (host == null || !CyberVaultCrypto.isBiometricAvailable(context)) appendLog("Enroll a strong biometric before enabling the shell gate.")
+                                else CyberVaultCrypto.authenticateShell(
+                                    host,
+                                    onSuccess = {
+                                        biometricGateEnabled = true
+                                        shellBiometricVerified = true
+                                        preferences.edit().putBoolean("biometric_shell_gate", true).apply()
+                                    },
+                                    onFailure = { appendLog("Biometric setup not completed: $it") }
+                                )
+                            }
+                        },
                         onStopOverlay = { FloatingTerminalService.stop(context) }
                     )
                 }
@@ -439,9 +513,22 @@ private fun installFirefox(context: Context, appendLog: (String) -> Unit) {
         .onFailure { appendLog("Package installer could not open: ${it.message ?: "unknown error"}") }
 }
 
+private fun normalizeVoiceCommand(transcript: String): String {
+    val phrase = transcript.trim().lowercase().removePrefix("cyberos ").trim()
+    return when {
+        phrase.startsWith("launch firefox") || phrase == "open firefox" -> "launch firefox"
+        phrase.startsWith("set theme ") -> "theme ${phrase.removePrefix("set theme ").trim()}"
+        phrase == "scan system" || phrase == "run diagnostics" -> "diagnostics"
+        phrase == "send alert" || phrase == "system alert" -> "notify"
+        phrase.startsWith("change theme ") -> "theme ${phrase.removePrefix("change theme ").trim()}"
+        else -> phrase
+    }
+}
+
 @Composable
 private fun BootScreen(logs: List<String>, theme: CyberTheme) {
     Box(Modifier.fillMaxSize().background(Color(0xFF07100D))) {
+        CyberDigitalRain(theme, Modifier.fillMaxSize())
         ShellBackdrop(theme)
         Column(
             modifier = Modifier.align(Alignment.Center).fillMaxWidth().padding(32.dp),
@@ -453,48 +540,6 @@ private fun BootScreen(logs: List<String>, theme: CyberTheme) {
             logs.takeLast(4).forEach { Text(it, color = theme.accent.copy(alpha = 0.88f), fontSize = 12.sp, fontFamily = FontFamily.Monospace) }
             Spacer(Modifier.height(8.dp))
             Text("INITIALIZING", color = Color.White, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-        }
-    }
-}
-
-@Composable
-private fun LockScreen(theme: CyberTheme, wallpaperUri: String?, onUnlock: () -> Unit, onEmergency: () -> Unit) {
-    var pin by rememberSaveable { mutableStateOf("") }
-    var error by rememberSaveable { mutableStateOf(false) }
-    Box(Modifier.fillMaxSize().background(Color(0xFF07100D))) {
-        WallpaperLayer(wallpaperUri, alpha = 0.28f)
-        ShellBackdrop(theme)
-        Column(
-            modifier = Modifier.align(Alignment.Center).fillMaxWidth().padding(horizontal = 34.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            Icon(Icons.Outlined.Security, contentDescription = null, tint = theme.accent, modifier = Modifier.size(36.dp))
-            Text("CYBEROS / LOCKED", color = theme.accent, fontSize = 20.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-            Text("LOCAL SHELL AUTHENTICATION", color = Color(0xFFA8C5B3), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-            OutlinedTextField(
-                value = pin,
-                onValueChange = { if (it.length <= 8 && it.all(Char::isDigit)) pin = it; error = false },
-                modifier = Modifier.fillMaxWidth(0.82f),
-                singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword, imeAction = ImeAction.Done),
-                label = { Text("ACCESS PIN") },
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = theme.accent,
-                    unfocusedBorderColor = theme.accent.copy(alpha = 0.45f),
-                    focusedLabelColor = theme.accent,
-                    unfocusedLabelColor = Color(0xFFA8C5B3),
-                    focusedTextColor = Color.White,
-                    unfocusedTextColor = Color.White,
-                    cursorColor = theme.accent
-                )
-            )
-            if (error) Text("ACCESS DENIED", color = Color(0xFFFF647C), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-            CyberButton("UNLOCK SHELL", theme, Modifier.fillMaxWidth(0.82f)) {
-                if (pin == "0420") onUnlock() else error = true
-            }
-            Text("EMERGENCY CHANNEL", color = Color(0xFF668272), fontSize = 10.sp, modifier = Modifier.clickable(onClick = onEmergency))
         }
     }
 }
@@ -520,6 +565,7 @@ private fun ShellHeader(theme: CyberTheme, tab: ShellTab, clearance: Boolean) {
 @Composable
 private fun ShellNavigation(selected: ShellTab, theme: CyberTheme, onSelect: (ShellTab) -> Unit) {
     val items = listOf(
+        ShellTab.Desktop to Icons.Outlined.Home,
         ShellTab.Terminal to Icons.Outlined.Terminal,
         ShellTab.Store to Icons.Outlined.Apps,
         ShellTab.Files to Icons.Outlined.FolderOpen,
@@ -549,9 +595,11 @@ private fun TerminalScreen(
     logs: List<String>,
     audioEnabled: Boolean,
     onCommand: (String) -> Unit,
+    onVoice: () -> Unit,
     onRequestAudio: () -> Unit,
     onClear: () -> Unit
 ) {
+    val view = androidx.compose.ui.platform.LocalView.current
     var command by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize()) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -580,7 +628,7 @@ private fun TerminalScreen(
             Text("$", color = theme.accent, fontSize = 16.sp, fontFamily = FontFamily.Monospace)
             OutlinedTextField(
                 value = command,
-                onValueChange = { command = it },
+                onValueChange = { command = it; performCyberHaptic(view) },
                 modifier = Modifier.weight(1f),
                 singleLine = true,
                 placeholder = { Text("enter command", color = Color(0xFF71877A), fontSize = 12.sp) },
@@ -600,6 +648,7 @@ private fun TerminalScreen(
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             Text("MIC ${if (audioEnabled) "LIVE" else "STANDBY"}", color = if (audioEnabled) theme.accent else Color(0xFF829688), fontSize = 9.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
             TextButtonLike(if (audioEnabled) "AUDIO ACTIVE" else "ENABLE AUDIO", theme, onClick = onRequestAudio)
+                    TextButtonLike("VOICE", theme, onClick = onVoice)
         }
     }
 }
@@ -669,6 +718,7 @@ private fun StoreScreen(
     onLaunchFirefox: () -> Unit,
     onDownloadFirefox: () -> Unit,
     onInstallDownloaded: () -> Unit,
+    onPlayStore: () -> Unit,
     onWebFallback: () -> Unit,
     onCloseWeb: () -> Unit
 ) {
@@ -708,8 +758,9 @@ private fun StoreScreen(
         if (!firefoxInstalled) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 CyberButton("INSTALL READY APK", theme, Modifier.weight(1f), onClick = onInstallDownloaded)
-                CyberButton("WEB FALLBACK", theme, Modifier.weight(1f), onClick = onWebFallback)
+                CyberButton("PLAY STORE", theme, Modifier.weight(1f), onClick = onPlayStore)
             }
+            TextButtonLike("OPEN MOZILLA WEB FALLBACK", theme, onClick = onWebFallback)
             Text(
                 if (installAllowed) "Installer authorization is enabled. Android still requires confirmation before installing the package."
                 else "APK installation requires the per-app Android setting and a final Package Installer confirmation.",
@@ -802,6 +853,7 @@ private fun FilesScreen(
 @Composable
 private fun SystemScreen(
     theme: CyberTheme,
+    biometricGateEnabled: Boolean,
     overlayEnabled: Boolean,
     installAllowed: Boolean,
     audioAllowed: Boolean,
@@ -812,6 +864,7 @@ private fun SystemScreen(
     onNotifications: () -> Unit,
     onSendAlert: () -> Unit,
     onTheme: (CyberTheme) -> Unit,
+    onBiometricGate: () -> Unit,
     onStopOverlay: () -> Unit
 ) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -821,6 +874,7 @@ private fun SystemScreen(
         PermissionRow("UNKNOWN APP INSTALLS", if (installAllowed) "AUTHORIZED" else "SETTINGS REQUIRED", theme, onInstallPermission)
         PermissionRow("MICROPHONE / VISUALIZER", if (audioAllowed) "AUTHORIZED" else "NOT GRANTED", theme, onAudio)
         PermissionRow("NOTIFICATION CHANNEL", if (notificationAllowed) "AUTHORIZED" else "NOT GRANTED", theme, onNotifications)
+        PermissionRow("BIOMETRIC SHELL GATE", if (biometricGateEnabled) "ENABLED // NO APP PIN" else "OPTIONAL / DISABLED", theme, onBiometricGate)
         Column {
             Text("DISPLAY PROFILE", color = theme.accent, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
             Spacer(Modifier.height(7.dp))
@@ -866,8 +920,9 @@ private fun PermissionRow(title: String, status: String, theme: CyberTheme, onCl
 
 @Composable
 private fun CyberButton(label: String, theme: CyberTheme, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val view = androidx.compose.ui.platform.LocalView.current
     Button(
-        onClick = onClick,
+        onClick = { performCyberHaptic(view); onClick() },
         modifier = modifier.height(42.dp),
         shape = RoundedCornerShape(4.dp),
         colors = ButtonDefaults.buttonColors(containerColor = theme.accent, contentColor = Color(0xFF07100D)),
@@ -879,7 +934,8 @@ private fun CyberButton(label: String, theme: CyberTheme, modifier: Modifier = M
 
 @Composable
 private fun TextButtonLike(label: String, theme: CyberTheme, onClick: () -> Unit) {
-    Text(label, modifier = Modifier.clickable(onClick = onClick).padding(horizontal = 5.dp, vertical = 8.dp), color = theme.accent, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+    val view = androidx.compose.ui.platform.LocalView.current
+    Text(label, modifier = Modifier.clickable { performCyberHaptic(view); onClick() }.padding(horizontal = 5.dp, vertical = 8.dp), color = theme.accent, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
 }
 
 @Composable

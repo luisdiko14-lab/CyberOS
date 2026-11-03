@@ -1,4 +1,5 @@
 <resources>
+    <string name="cyberos_widget_description">CyberOS shell status, battery gauge, and quick alert</string>
     <style name="Theme.CyberOS" parent="android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">monospace</item>
         <item name="android:colorAccent">#54F9A2</item>

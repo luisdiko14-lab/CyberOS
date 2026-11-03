@@ -328,13 +328,31 @@ object FirefoxInstaller {
 
     fun install(context: Context, downloadId: Long): Boolean {
         if (!context.packageManager.canRequestPackageInstalls()) return false
-        val uri = (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).getUriForDownloadedFile(downloadId)
-            ?: return false
-        val installIntent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
+        val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val query = DownloadManager.Query().setFilterById(downloadId)
+        val download = downloadManager.query(query).use { cursor ->
+            if (!cursor.moveToFirst()) return false
+            val status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+            if (status != DownloadManager.STATUS_SUCCESSFUL) return false
+            downloadManager.getUriForDownloadedFile(downloadId)
+        } ?: return false
+        val installIntent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+            data = download
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            putExtra(Intent.EXTRA_RETURN_RESULT, true)
         }
         context.startActivity(installIntent)
         return true
+    }
+
+    fun openPlayStore(context: Context): Boolean {
+        val marketIntent = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$FIREFOX_PACKAGE"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return runCatching { context.startActivity(marketIntent) }.isSuccess || runCatching {
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=$FIREFOX_PACKAGE"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }.isSuccess
     }
 }
